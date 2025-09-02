@@ -6,116 +6,335 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/valyala/fasthttp"
 )
 
+// semaphore for concurrency limiting
+var sem = make(chan struct{}, 4)
+
+// Action represents a device action to be processed by worker pool.
+type Action struct {
+	Cmd   string // original command string
+	Type  string // "tap" or "swipe"
+	Reply chan string
+}
+
+var (
+	// actions channel used by HTTP handlers to enqueue work
+	actions chan *Action
+)
+
 // tap command format: tap <x> <y> <amount> <delay>
 // example: tap 100 200 5 1000
-func handleTapCommand(cmdStr string) string {
-	coords := strings.TrimPrefix(cmdStr, "tap ")
-	parts := strings.Split(coords, " ")
+// parseTap parses a tap command string and returns integer values or error.
+// Expected formats:
+// "tap <x> <y>" (defaults amount=1, delay=0)
+// "tap <x> <y> <amount> <delay>"
+func parseTap(cmdStr string) (x, y, amount, delay int, err error) {
+	coords := strings.TrimSpace(strings.TrimPrefix(cmdStr, "tap"))
+	parts := strings.Fields(coords)
 	if len(parts) < 2 {
-		return "ERROR|invalid tap command format, expected: tap <x> <y> <amount> <delay>"
+		return 0, 0, 0, 0, fmt.Errorf("invalid tap command format, expected: tap <x> <y> [amount] [delay]")
 	}
-	x := parts[0]
-	y := parts[1]
-
-	amount := 1 // default amount is 1
+	x, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return
+	}
+	y, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return
+	}
+	amount = 1
 	if len(parts) > 2 {
-		parsedAmount, err := strconv.Atoi(parts[2])
-		if err != nil || parsedAmount < 1 {
-			return fmt.Sprintf("ERROR|invalid amount value: %v", err)
+		amount, err = strconv.Atoi(parts[2])
+		if err != nil || amount < 1 {
+			return 0, 0, 0, 0, fmt.Errorf("invalid amount")
 		}
-		amount = parsedAmount
 	}
-	delay := 0
+	delay = 0
 	if len(parts) > 3 {
-		parsedDelay, err := strconv.Atoi(parts[3])
-		if err != nil || parsedDelay < 0 {
-			return fmt.Sprintf("ERROR|invalid delay value: %v", err)
+		delay, err = strconv.Atoi(parts[3])
+		if err != nil || delay < 0 {
+			return 0, 0, 0, 0, fmt.Errorf("invalid delay")
 		}
-		delay = parsedDelay
 	}
+	return
+}
+
+func handleTapCommand(cmdStr string) string {
+	x, y, amount, delay, err := parseTap(cmdStr)
+	if err != nil {
+		return "ERROR|" + err.Error()
+	}
+	// run taps with per-call timeout and no shell to reduce injection surface
 	for i := 0; i < amount; i++ {
-		// execute the tap command using adb shell input tap <x> <y>
-		cmd := exec.Command("/system/bin/sh", "-c", fmt.Sprintf("input tap %s %s", x, y))
-		_, err := cmd.CombinedOutput()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx,
+			"/system/bin/app_process",
+			"/system/bin",                      // same as script's first arg ($base/bin)
+			"com.android.commands.input.Input", // Java class
+			"tap", strconv.Itoa(x), strconv.Itoa(y),
+		)
+		cmd.Env = append(os.Environ(), "CLASSPATH=/system/framework/input.jar")
+		out, err := cmd.CombinedOutput()
 		if err != nil {
-			return fmt.Sprintf("ERROR|executing command failed: %v", err)
+			return fmt.Sprintf("ERROR|executing command failed: %v output:%s", err, string(out))
 		}
 		if delay > 0 {
 			time.Sleep(time.Duration(delay) * time.Millisecond)
 		}
 	}
-	return fmt.Sprintf("OK|tapped %s %s %d %d", x, y, amount, delay)
+	_ = amount
+	return fmt.Sprintf("OK|tapped %d %d %d %d", x, y, amount, delay)
 }
 
-// swipe command format: swipe <x1> <y1> <x2> <y2> <duration>
-func handleSwipeCommand(cmdStr string) string {
-	coords := strings.TrimPrefix(cmdStr, "swipe ")
-	parts := strings.Split(coords, " ")
-	if len(parts) != 5 {
-		return "ERROR|invalid swipe command format, expected: swipe <x1> <y1> <x2> <y2> <duration>"
+// swipe command format: swipe <x1> <y1> <x2> <y2> <duration> <amount> <delay>
+// parseSwipe parses swipe command string: swipe x1 y1 x2 y2 duration amount delay
+func parseSwipe(cmdStr string) (x1, y1, x2, y2, duration, amount, delay int, err error) {
+	coords := strings.TrimSpace(strings.TrimPrefix(cmdStr, "swipe"))
+	parts := strings.Fields(coords)
+	if len(parts) != 7 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("invalid swipe command format, expected: swipe <x1> <y1> <x2> <y2> <duration> <amount> <delay>")
 	}
-	x1 := parts[0]
-	y1 := parts[1]
-	x2 := parts[2]
-	y2 := parts[3]
-	duration := parts[4]
-	// execute the swipe command using adb shell input swipe <x1> <y1> <x2> <y2> <duration>
-	cmd := exec.Command("/system/bin/sh", "-c", fmt.Sprintf("input swipe %s %s %s %s %s", x1, y1, x2, y2, duration))
-	_, err := cmd.CombinedOutput()
+	x1, err = strconv.Atoi(parts[0])
 	if err != nil {
-		return fmt.Sprintf("ERROR|executing command failed: %v", err)
+		return
 	}
-	return fmt.Sprintf("OK|swiped %s %s %s %s %s", x1, y1, x2, y2, duration)
+	y1, err = strconv.Atoi(parts[1])
+	if err != nil {
+		return
+	}
+	x2, err = strconv.Atoi(parts[2])
+	if err != nil {
+		return
+	}
+	y2, err = strconv.Atoi(parts[3])
+	if err != nil {
+		return
+	}
+	duration, err = strconv.Atoi(parts[4])
+	if err != nil || duration < 0 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("invalid duration")
+	}
+	amount, err = strconv.Atoi(parts[5])
+	if err != nil || amount < 1 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("invalid amount")
+	}
+	delay, err = strconv.Atoi(parts[6])
+	if err != nil || delay < 0 {
+		return 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("invalid delay")
+	}
+	return
 }
+
+func handleSwipeCommand(cmdStr string) string {
+	x1, y1, x2, y2, duration, amount, delay, err := parseSwipe(cmdStr)
+	if err != nil {
+		return "ERROR|" + err.Error()
+	}
+	// run taps with per-call timeout and no shell to reduce injection surface
+	for i := 0; i < amount; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx,
+			"/system/bin/app_process",
+			"/system/bin",                      // same as script's first arg ($base/bin)
+			"com.android.commands.input.Input", // Java class
+			"swipe", strconv.Itoa(x1), strconv.Itoa(y1), strconv.Itoa(x2),
+			strconv.Itoa(y2), strconv.Itoa(duration),
+		)
+		cmd.Env = append(os.Environ(), "CLASSPATH=/system/framework/input.jar")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Sprintf("ERROR|executing command failed: %v output:%s", err, string(out))
+		}
+		if delay > 0 {
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+	}
+	return fmt.Sprintf("OK|swiped %d %d %d %d %d %d %d", x1, y1, x2, y2, duration, amount, delay)
+}
+
+// worker processes actions from the queue. It attempts to execute quickly
+// and sends back the result on the Action.Reply channel.
+func worker() {
+	for a := range actions {
+		var res string
+		switch a.Type {
+		case "tap":
+			res = handleTapCommand(a.Cmd)
+		case "swipe":
+			res = handleSwipeCommand(a.Cmd)
+		default:
+			res = "ERROR|unknown action"
+		}
+		// non-blocking send; if client isn't listening, drop result
+		select {
+		case a.Reply <- res:
+		default:
+		}
+	}
+}
+
+// backgroundCapture periodically captures screenshot bytes into cachedCapture
+// so /cap can return most recent image quickly.
+// background capture removed; /cap will run synchronous capture when enabled.
 
 func main() {
+	// Basic logging flags
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// Config
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	// config worker pool & capture
+	workers := 4
+	if v := os.Getenv("WORKERS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
+	queueSize := 128
+	if v := os.Getenv("QUEUE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			queueSize = n
+		}
+	}
+
+	// create action queue and start workers
+	actions = make(chan *Action, queueSize)
+	for i := 0; i < workers; i++ {
+		go func() {
+			worker()
+		}()
+	}
+
+	// create fasthttp server for graceful shutdown
 	handler := func(ctx *fasthttp.RequestCtx) {
-		if string(ctx.Method()) == "GET" && string(ctx.Path()) == "/cap" {
-			// GET /cap return bitmap image of screenshot
+		// simple routing
+		method := string(ctx.Method())
+		path := string(ctx.Path())
+
+		// limit body size for POST endpoints
+		const maxBody = 1024 // 1KB
+		if method == "POST" && len(ctx.PostBody()) > maxBody {
+			ctx.SetStatusCode(fasthttp.StatusRequestEntityTooLarge)
+			ctx.SetBodyString("ERROR|request body too large")
+			return
+		}
+
+		// concurrency limiter
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		default:
+			// metrics disabled: would increment errorCount
+			ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+			ctx.SetBodyString("ERROR|server busy")
+			return
+		}
+
+		switch {
+		case method == "GET" && path == "/cap":
 			ctx.SetContentType("image/bmp")
-			cmdCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			cmdCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			cmd := exec.CommandContext(cmdCtx, "/data/local/tmp/ascreencap", "--stdout")
 			stdout, err := cmd.StdoutPipe()
 			if err != nil {
 				ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-				ctx.SetBodyString("Error starting command")
+				ctx.SetBodyString("ERROR|starting command")
 				return
 			}
 			if err := cmd.Start(); err != nil {
 				ctx.SetStatusCode(fasthttp.StatusInternalServerError)
-				ctx.SetBodyString("Error running command")
+				ctx.SetBodyString("ERROR|running command")
 				return
 			}
-			// Use buffered reader for faster I/O
 			reader := bufio.NewReaderSize(stdout, 256*1024) // 256KB buffer
 			io.Copy(ctx, reader)
 			cmd.Wait()
-		} else if string(ctx.Method()) == "POST" && string(ctx.Path()) == "/swipe" {
-			// POST /swipe <action>
 
+		case method == "POST" && path == "/swipe":
+			// enqueue swipe action for background worker to lower request latency
 			actionStr := string(ctx.PostBody())
-			result := handleSwipeCommand(actionStr)
-			ctx.SetBodyString(result)
-		} else if string(ctx.Method()) == "POST" && string(ctx.Path()) == "/tap" {
-			// POST /tap <action>
+			act := &Action{Cmd: actionStr, Type: "swipe", Reply: make(chan string, 1)}
+			select {
+			case actions <- act:
+				// wait briefly for worker result
+				select {
+				case res := <-act.Reply:
+					ctx.SetBodyString(res)
+				case <-time.After(200 * time.Millisecond):
+					// worker didn't respond fast; return accepted
+					ctx.SetStatusCode(fasthttp.StatusAccepted)
+					ctx.SetBodyString("OK|swipe enqueued")
+				}
+			default:
+				ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				ctx.SetBodyString("ERROR|queue full")
+			}
 
+		case method == "POST" && path == "/tap":
+			// enqueue tap action for background worker to lower request latency
 			actionStr := string(ctx.PostBody())
-			result := handleTapCommand(actionStr)
-			ctx.SetBodyString(result)
-		} else {
+			act := &Action{Cmd: actionStr, Type: "tap", Reply: make(chan string, 1)}
+			select {
+			case actions <- act:
+				select {
+				case res := <-act.Reply:
+					ctx.SetBodyString(res)
+				case <-time.After(150 * time.Millisecond):
+					// immediate response to minimize latency
+					ctx.SetStatusCode(fasthttp.StatusAccepted)
+					ctx.SetBodyString("OK|tap enqueued")
+				}
+			default:
+				ctx.SetStatusCode(fasthttp.StatusServiceUnavailable)
+				ctx.SetBodyString("ERROR|queue full")
+			}
+
+		case method == "GET" && path == "/health":
+			ctx.SetContentType("application/json")
+			ctx.SetStatusCode(fasthttp.StatusOK)
+			ctx.SetBodyString("{\"status\":\"ok\"}")
+
+		default:
 			ctx.SetStatusCode(fasthttp.StatusNotFound)
 		}
 	}
 
-	log.Printf("Starting server on port 8080")
-	log.Fatal(fasthttp.ListenAndServe(":8080", handler))
+	srv := &fasthttp.Server{
+		Handler:      handler,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+		Name:         "httpbot",
+	}
+
+	go func() {
+		log.Printf("Starting server on port %s", port)
+		if err := srv.ListenAndServe(":" + port); err != nil {
+			log.Printf("server stopped: %v", err)
+		}
+	}()
+
+	// graceful shutdown on SIGINT/SIGTERM
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+	log.Printf("Shutting down server")
+	srv.Shutdown()
 }
