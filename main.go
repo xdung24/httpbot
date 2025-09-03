@@ -32,6 +32,8 @@ var (
 	actions chan *Action
 )
 
+const devicePath = "/dev/input/event5" // touch screen
+
 // tap command format: <x> <y> <amount> <delay>
 // example: 100 200 5 1000
 // parseTap parses a tap command string and returns integer values or error.
@@ -75,10 +77,18 @@ func handleTapCommand(cmdStr string) string {
 		return "ERROR|" + err.Error()
 	}
 	// run taps with per-call timeout and no shell to reduce injection surface
+	dev, err := OpenInputDevice(devicePath)
+	if err != nil {
+		log.Printf("open device: %v", err)
+	}
+	defer dev.Close()
 	for i := 0; i < amount; i++ {
-		out, err := runInputCommand(3*time.Second, "tap", strconv.Itoa(x), strconv.Itoa(y))
-		if err != nil {
-			return fmt.Sprintf("ERROR|executing command failed: %v output:%s", err, out)
+		// out, err := runInputCommand(3*time.Second, "tap", strconv.Itoa(x), strconv.Itoa(y))
+		// if err != nil {
+		// 	return fmt.Sprintf("ERROR|executing command failed: %v output:%s", err, out)
+		// }
+		if err := dev.SendTouch(x*60, y*33); err != nil {
+			log.Printf("send touch: %v", err)
 		}
 		if delay > 0 {
 			time.Sleep(time.Duration(delay) * time.Millisecond)
@@ -246,6 +256,12 @@ func worker() {
 // so /cap can return most recent image quickly.
 // background capture removed; /cap will run synchronous capture when enabled.
 
+// Pre-allocated responses for better performance
+var (
+	healthResponse  = []byte(`{"status":"ok"}`)
+	contentTypeJSON = []byte("application/json")
+)
+
 func main() {
 	// Basic logging flags
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -399,22 +415,24 @@ func main() {
 				ctx.SetBodyString("ERROR|queue full")
 			}
 
-		case method == "GET" && path == "/health":
-			ctx.SetContentType("application/json")
-			ctx.SetStatusCode(fasthttp.StatusOK)
-			ctx.SetBodyString("{\"status\":\"ok\"}")
-
 		default:
 			ctx.SetStatusCode(fasthttp.StatusNotFound)
 		}
 	}
 
 	srv := &fasthttp.Server{
-		Handler:      handler,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
-		Name:         "httpbot",
+		Handler:            handler,
+		ReadTimeout:        5 * time.Second,  // Reduced from 15s
+		WriteTimeout:       5 * time.Second,  // Reduced from 15s
+		IdleTimeout:        30 * time.Second, // Reduced from 60s
+		MaxConnsPerIP:      1000,
+		MaxRequestsPerConn: 1000,
+		TCPKeepalive:       true,
+		DisableKeepalive:   false,
+		ReadBufferSize:     4096,  // Smaller buffer for lower latency
+		WriteBufferSize:    4096,  // Smaller buffer for lower latency
+		ReduceMemoryUsage:  false, // Prioritize speed over memory
+		Name:               "httpbot",
 	}
 
 	go func() {
