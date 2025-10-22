@@ -17,6 +17,6 @@ CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -a -ldflags '-extldflags "-static
 echo "Build complete."
 
 echo "Copying dist to EvonyBot..."
-cp -r dist ../EvonyBot/tools/httpbot 
-rm ../EvonyBot/tools/httpbot/.gitignore
+mkdir -p ../EvonyBot/tools/httpbot/
+cp -r dist/httpbot* ../EvonyBot/tools/httpbot/
 echo "Done."

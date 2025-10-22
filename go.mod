@@ -1,6 +1,6 @@
 module httpbot
 
-go 1.24.0
+go 1.25.3
 
 require github.com/valyala/fasthttp v1.65.0
 
