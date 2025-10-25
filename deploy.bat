@@ -16,7 +16,7 @@ adb connect 127.0.0.1:%ADB_PORT%
 echo Stopping httpbot on device (if running)...
 adb -s 127.0.0.1:%ADB_PORT% shell "p=`pidof httpbot` && [ -n \"$p\" ] && kill -9 $p || true"
 echo Pushing new binary and start script...
-adb -s 127.0.0.1:%ADB_PORT% push build\httpbot-linux-%ARCH% /data/local/tmp/httpbot
+adb -s 127.0.0.1:%ADB_PORT% push dist\httpbot-linux-%ARCH% /data/local/tmp/httpbot
 adb -s 127.0.0.1:%ADB_PORT% shell chmod +x /data/local/tmp/httpbot
 adb -s 127.0.0.1:%ADB_PORT% push start-httpbot.sh /data/local/tmp/start-httpbot.sh
 adb -s 127.0.0.1:%ADB_PORT% shell chmod +x /data/local/tmp/start-httpbot.sh
